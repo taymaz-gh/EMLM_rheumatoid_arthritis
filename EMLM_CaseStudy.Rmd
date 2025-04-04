@@ -1,0 +1,1048 @@
+---
+title: "Progression of joint destruction in rheumatoid arthritis"
+author: "Group 2"
+date: "2025-03-30"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message = FALSE,error = FALSE, warning = FALSE)
+```
+
+Package library
+```{r }
+library(nlme) 
+library(lme4)
+library(lattice)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(lme4)
+library(lattice)
+library(car)
+library(GLMMadaptive)
+library(gridExtra) 
+library(patchwork)
+```
+
+# Basic information about the dataset
+```{r }
+load("data2.RData")  # Data import. The dataset is in long format. No need to transform.
+data = DF              
+str(data)   #  data structure
+dim(data)   #  2723    8
+# range(data$SHS) # 0,119, Sharp index at each of the 8 visits, respectively.
+unique(data$Severity) # Disease severity (0: low, 1: high) at each of the 8 visits, respectively.
+unique(data$Visit)  # 0,1,2,3,4,5,6,7 visits by year
+unique(data$Period) # inclusion period,  period A:before "1996-01-01"; period B:  after "1996-01-01" 
+range(data$Age) # 41.2~87.9, age of the patient at inclusion.
+unique(data$sex) #  1: males, 2: females
+unique(data$SNP) # single nucleotide polymorphism (0: no variant alleles, 1: variant allele, 2: variant alleles).
+```
+## 1.Missing data
+It is introduced that "Not all planned measurements have been recorded for several reasons e.g., loss to follow-up, relocation, remission, etc". In dataset, there is no missing data in observed dataset. We deem it as missing-at-random (MAR) and missing completely-at-random (MCAR) conditions. 
+Missing data distribution table: 
+```{r }
+missing_rows <- sum(rowSums(is.na(data)) > 0)
+missing_rows # 0. There is no missing data in observed dataset. 
+cat("\n### Visit Distribution\n")
+table(data$Visit)  # Count of observations per visit time point
+prop.table(table(data$Visit))  # Proportion per visit
+```
+
+Missing data distribution graphing: 
+```{r }
+visit_counts <- data %>%
+  group_by(Visit) %>%
+  summarise(N = n())
+
+ggplot(data.frame(Visit = c(0:7), Count = c(500, 326, 334, 307, 327, 321, 299, 309)), 
+       aes(x = Visit, y = Count)) +
+  geom_line() +
+  geom_point() +
+  geom_text(aes(label = Count), vjust = -0.5, size = 5) + 
+  labs(title = "Number of Patients Over Time", x = "Visit", y = "Number of Patients")+
+  ylim(c(200, 550))
+```
+After the baseline visit, different combinations of patients, each consisting of about 63.5% ± 2.5% of the base-line visited patients, has participated in each visit, thereafter.
+It is introduced that "Not all planned measurements have been recorded for several reasons e.g., loss to follow-up, relocation, remission, etc". 
+These missingness reasons have nothing to do with the missed outcomes, which suggests that perhaps the mechanism is not MNAR. Exploring the data shows there are both dropped-outs and intermittents in the data: 472 Intermittent Missingness and 28 Dropouts.
+But why there is no NA in the data? because firstly this is a Long dataset, not a Wide one! NA's will apear if we convert it from long to wide, and secondly, when a patient has missed a visit, the value of no variable (not even his id) is recorded for him on that date into the dataset, thus no NA for him on that date!
+but if we use likelihood-based methods to estimate model parameters, then the missingness can be ignored, provided that the missingness mechanism is MCAR or MAR. So, for subject-specific inferences we can use GLMM, but for overall inferences we cannot use GEE (because GEE is not a likelihood approach), but we have to derive these inferences from GLMM results or by GLMMadaptive approximation.
+
+
+## 2.Transform variables into factor
+```{r }
+data$Severity.f = factor(data$Severity)
+data$SNP.f = factor(DF$SNP)
+data$log_SHS <- log(data$SHS + 1)
+# head(data)  # keep visit continuous variable. 
+```
+
+# Sharp index Analysis
+## 1.Descriptive Analysis
+### 1.1 mean structure
+```{r}
+ mean_SHS <- data %>% group_by(Period, Visit) %>%
+  summarise(mean_SHS = mean(SHS, na.rm = TRUE),sd_sharp = sd(SHS, na.rm = TRUE),n = n(),.groups = "drop")%>% mutate(se = sd_sharp / sqrt(n))
+mean_SHS_SNP <- data %>% group_by(Period, SNP,Visit) %>% summarise(mean_SHS = mean(SHS, na.rm = TRUE),n = n(),.groups = "drop")
+# Mean SHS by Period
+p1 <-ggplot(mean_SHS, aes(x = Visit, y = mean_SHS, color = Period, group = Period)) +
+  geom_line(linewidth = 1.2) +geom_point(size = 2) + labs(title = "Mean SHS Over Time by Period",x = "Visits",y = "Mean SHS") +
+  geom_errorbar(aes(ymin = mean_SHS - se, ymax = mean_SHS + se), width = 0.2) +
+  labs(title = "", y = "Mean Sharp Index", x = "Visits") +theme_minimal()
+# Mean SHS Over Period by SNP
+p2 <-ggplot(mean_SHS_SNP, aes(x = Visit, y = mean_SHS, color = Period, group = Period)) +
+  geom_line(size = 1.2) +geom_point(size = 2) +facet_wrap(~ SNP) +
+  labs(title = "",x = "Visits",y = "Mean Sharp Index (SHS)") +
+  theme_minimal() +theme(legend.position = "top")  
+# p1 + p2 
+```
+
+### 1.2 random effect
+```{r }
+IDs_A <- unique(data$id[data$Period == "A"])   # Individual changes in SHS by period.
+IDs_B <- unique(data$id[data$Period == "B"])
+set.seed(123)  # reproducibility   
+sample_A <- sample(IDs_A, 10)  # How many to sample from each period? (Here, 10 from A and 10 from B)
+sample_B <- sample(IDs_B, 10)
+sampled_IDs <- c(sample_A, sample_B)  # Combine sampled IDs
+DF_sampled <- subset(data, id %in% sampled_IDs)  # Filter dataset
+p1 <-xyplot(SHS ~ Visit | Period,groups = id,data = DF_sampled,type = "l",xlab = "Visit",ylab = "SHS",auto.key = list(title = "id", space = "up"),panel = function(x, y, groups, ...) {panel.superpose(x, y, groups, ...)})
+IDs_E <- unique(data$id[data$SNP == 0])     # Individual changes in SHS by SNP
+IDs_F <- unique(data$id[data$SNP == 1])
+IDs_G <- unique(data$id[data$SNP == 2])
+sample_E <- sample(IDs_E, 10) # How many to sample from each period? (Here, 10 from A and 10 from B)
+sample_F <- sample(IDs_F, 10)
+sample_G <- sample(IDs_G, 10)
+sampled_IDs <- c(sample_E, sample_F, sample_G)  # Combine sampled IDs
+DF_sampled <- subset(data, id %in% sampled_IDs) # Filter dataset
+p2 <-xyplot(SHS ~ Visit | SNP,groups = id,data = DF_sampled,type = "l",xlab = "Visit",ylab = "SHS", auto.key = FALSE,
+            panel = function(x, y, groups, ...) {panel.superpose(x, y, groups, ...) })  # Create the plot
+# grid.arrange(p1, p2, ncol = 2)
+```
+
+## 2.Model Building and selection
+### 2.1 Initial model 
+```{r}
+# fit an elaborate model according to EDA, we try to capture non-linear trend of the data and we fit quadratic model.
+model1 <- lme(SHS ~ (Period + Age + sex + SNP.f) * (I(Visit) + I(Visit^2)), data = data, random = ~ 1| id,method = "REML")
+p1 <-plot(model1, resid(., type = "n") ~ fitted(.), type = c("p", "smooth"),col = "#A1C9F4",lwd = 3)  # check Residuals vs Fitted values
+p2 <-qqnorm(model1, ~ resid(., type = "n"), abline = c(0, 1),col = "#A1C9F4")   # check  qq plot
+# grid.arrange(p1, p2, ncol = 2)
+```
+### 2.2 Hypothesis testing for covariances
+```{r}
+# Fit LMM with random intercepts and random slopes
+model_slope <- lme(log_SHS ~ (Period + Age + sex + SNP.f) * Visit, data = data, random = ~ Visit| id,method = "REML")  
+# Fit LMM with only random intercepts
+model_intercept <- lme(log_SHS ~ (Period + Age + sex + SNP.f) * Visit, data = data, random = ~ 1| id,method = "REML")  
+# Compare the two models with LRT. The result is significant, which means model_slope is better.
+lrt <- anova(model_slope, model_intercept)
+# 0.5*pchisq(lrt$ L.Ratio[2], df=1, lower.tail = FALSE) + 0.5*pchisq(lrt$ L.Ratio[2], df=2, lower.tail = FALSE)
+```
+### 2.3 Hypothesis testing for fixed effects
+```{r}
+# extract t_table of estimated parameters  # summary(model_slope)$tTable
+# Fit a simplified mean model with random intercept and slope, and this our final model.
+model_new <- lme(log_SHS ~ Period + sex + Visit + sex * Visit, data = data, random = ~ Visit| id,method = "REML")   
+```
+### 2.4 Estimated variances and covariance of randoms effects
+```{r}
+vcov_mat <- getVarCov(model_new)[1:2, 1:2]
+total_variance <- vcov_mat[1,1] + vcov_mat[2,2] + 2 * vcov_mat[1,2]
+```
+### 2.5 Model diagnostics
+```{r}
+p3 <-plot(model_new, resid(., type = "n") ~ fitted(.),type = c("p", "smooth"),col = "#A1C9F4",lwd = 3) # Residuals vs Fitted values
+# Residuals vs Fitted values per gender group
+p4 <-plot(model_new, resid(., type = "n") ~ fitted(.) | sex, type = c("p", "smooth"), col = "#A1C9F4",lwd = 3) 
+# Residuals vs Fitted values per period
+p5 <-plot(model_new, resid(., type = "n") ~ fitted(.) | Period, type = c("p", "smooth"), col = "#A1C9F4",lwd = 3)
+# grid.arrange(p3, p4, p5,ncol = 3)
+```
+
+```{r}
+residual_con <- residuals(model_new,type = "n",level = 1)
+# Extract residuals and Visit variable
+data1 <- data.frame(id = data$id,Visit = data$Visit,Period = data$Period,sex = data$sex,residuals = residual_con)
+p6 <-ggplot(data1, aes(x = Visit, y = residuals)) +geom_point(color ="#FFB6C1")+
+  geom_boxplot(aes(group = Visit), alpha = 0.5,width = 0.5,color = "#A1C9F4", fill = "#A1C9F4") +
+  labs(title = "Plots of normalized conditional residuals")    # conditional residuals
+data1$sex <- factor(data1$sex, levels = c("male", "female"))
+data1$Period <- factor(data1$Period, levels = c("A", "B"))
+data1$Visit <- factor(as.character(data$Visit), levels = c("0", "1", "2", "3", "4","5","6","7"))
+p7 <-ggplot(data1, aes(x = Visit, y = residuals)) +geom_boxplot(alpha = 0.5, color = "#A1C9F4", fill = "#A1C9F4", width = 0.5) +
+  geom_point(color ="#FFB6C1") +facet_grid(. ~ sex) +  labs(title = "Plots of normalized conditional residuals per sex group") 
+p8 <-ggplot(data1, aes(x = Visit, y = residuals)) + geom_boxplot(alpha = 0.5, color = "#A1C9F4", fill = "#A1C9F4", width = 0.5) +     geom_point(color ="#FFB6C1") +facet_grid(. ~ Period) +  labs(title = "Plots of normalized conditional residuals per Period") 
+# p6  # p7 # p8
+```
+
+```{r}
+#Histogram for EB estimates of random Intercepts
+ranef_est <- ranef(model_new, which = "id", condVar = TRUE)
+hist(ranef_est$"(Intercept)",main = "Histogram of the EB estimates of the random intercepts",freq = FALSE,xlab = "EB estimates (Intercept)",col = "darkgray",border = "#A1C9F4",breaks = 20)
+#Histogram for EB estimates of random slopes
+hist(ranef_est$"Visit",main = "Histogram of the EB estimates of the random slopes (Visit)",freq = FALSE,xlab = "EB estimates (Visit)",col = "darkgrey",border = "#A1C9F4",breaks = 20)
+# Interpretation of the Random Effects Structure 
+ranefs <- ranef(model_new)
+plot(ranefs[, "(Intercept)"], ranefs[, "Visit"],xlab = "Random Intercepts", ylab = "Random Slopes",main = "Empirical Bayes Estimates")
+qqnorm(model_new, ~ resid(., type = "n"), abline = c(0, 1),col = "#A1C9F4")    # QQ plot to check
+acf(residuals(model_new, type = "response"))    # autocorrelation
+```
+
+
+# Disease Severity Analysis
+## 1.Descriptive analysis
+Q1.Present summary statistics for the sample at hand i.e., number of males/females, age distribution, etc.
+```{r }
+# Provides an overview of numeric and factor variables
+summary(data)  
+cat("\n### Visit Distribution\n")
+table(data$Visit)  # Count of observations per visit time point
+prop.table(table(data$Visit))  # Proportion per visit
+cat("\n### Gender Distribution\n")
+table(data$sex)  # Frequency of male (1) and female (2)
+prop.table(table(data$sex))  # Proportion of males and females
+
+cat("\n### Age Distribution\n")
+range(data$Age)  # Min and max age
+mean(data$Age)  # Average age
+median(data$Age)  # Median age
+sd(data$Age)  # Standard deviation
+
+cat("\n### SNP Distribution\n")
+table(data$SNP)  # Count of each SNP category (0,1,2)
+prop.table(table(data$SNP))  # Proportion of each SNP category
+
+cat("\n### Period Distribution\n")
+table(data$Period)  # Count of patients in Period A vs. B
+prop.table(table(data$Period))  # Proportion of each period
+
+cat("\n### Disease Severity Distribution\n")
+table(data$Severity)  # Count of low (0) vs high (1) severity
+prop.table(table(data$Severity))  # Proportion of each severity level
+```
+data contains 2723 records
+about 46% are male and 54% are female
+participants of age 41 to 88 with an average of 64 years old and a Standard
+deviation of 13.6 yrs
+Proportion of each SNP category
+50% SNP=0, 30% SNP=1, 20% SNP=2
+Proportion of patients in each period :  nearly the same (50%-50%)
+Proportion of patients for each severity level
+76% severity=0 and 24% severity=1
+
+For age, we categorized the continuous data into groups:
+```{r }
+# Create European Age Groups
+data$Age_Group <- cut(data$Age, 
+                      breaks = c(40, 45, 50, 55, 60, 65, 70, 75, 80, Inf), 
+                      include.lowest = TRUE, 
+                      right = FALSE, 
+                      labels = c("40-44", "45-49", "50-54", "55-59", "60-64", "65-69", "70-74", "75-79", "80+"))
+
+cat("\n### Age group Distribution\n")
+table(data$Age_Group)  # Count of patients in Period A vs. B
+prop.table(table(data$Age_Group))  # Proportion of each period
+
+```
+
+## 2.Exploratory analysis
+
+### 2.1 cross table & graphing
+
+Check the relationship between Severity and other variables. 
+```{r }
+cat("\n### Severity vs. Visit\n")
+table(data$Severity.f, data$Visit)
+prop.table(table(data$Severity.f, data$Visit), margin = 2)  # Proportion within Visit
+
+cat("\n### Severity vs. Gender\n")
+table(data$Severity.f, data$sex)  # Counts
+prop.table(table(data$Severity.f, data$sex), margin = 2)  # Proportion within Gender
+
+cat("\n### Severity vs. Age group\n")
+table(data$Severity.f, data$Age_Group)  # Counts
+prop.table(table(data$Severity.f, data$Age_Group), margin = 2)  # Proportion within Gender
+
+
+cat("\n### Severity vs. SNP\n")
+table(data$Severity.f, data$SNP)
+prop.table(table(data$Severity.f, data$SNP), margin = 2)  # Proportion within SNP
+
+cat("\n### Severity vs. Period\n")
+table(data$Severity, data$Period)
+prop.table(table(data$Severity, data$Period), margin = 2)  # Proportion within Period
+
+```
+### 2.2 Plots cross analysis 
+Check the relationship between severity and other variables. 
+```{r }
+# Severity vs. Visit
+ggplot(data, aes(x = as.factor(Visit), fill = Severity.f)) +
+  geom_bar(position = "fill") +
+  labs(x = "Visit", y = "Proportion") +
+  scale_fill_manual(values = c("#A1C9F4", "#FFB6C1"), name = "Severity") +
+theme_minimal(base_size = 20) +  
+  theme(axis.text.x = element_text(size = 16))  
+# Severity vs. Gender
+ggplot(data, aes(x = sex, fill = Severity.f)) +
+  geom_bar(position = "fill") +
+  labs(title = "Severity Distribution by Gender", x = "Gender", y = "Proportion") +
+  scale_fill_manual(values = c("#A1C9F4", "#FFB6C1"), name = "Severity") +
+  theme_minimal()
+
+# Severity vs. Age group
+ggplot(data, aes(x = Age_Group, fill = Severity.f)) +
+  geom_bar(position = "fill") +
+  labs(title = "Severity Distribution by Age Group", x = "Age Group", y = "Proportion") +
+  scale_fill_manual(values = c("#A1C9F4", "#FFB6C1"), name = "Severity") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), minimal = TRUE)
+
+# Severity vs. Age (keep age as continuous variable and use Box Plot)
+ggplot(data, aes(x = Severity.f, y = Age, fill = Severity.f)) +
+  geom_boxplot(outlier.shape = 16, outlier.size = 2, alpha = 0.6) +
+  labs(title = "Age Distribution by Severity", x = "Severity", y = "Age") +
+  scale_fill_manual(values = c("#A1C9F4", "#FFB6C1")) +
+  theme_minimal()
+
+# Severity vs. SNP
+ggplot(data, aes(x = as.factor(SNP), fill = Severity.f)) +
+  geom_bar(position = "fill") +
+  labs(title = "Severity Distribution by SNP", x = "SNP", y = "Proportion") +
+  scale_fill_manual(values = c("#A1C9F4", "#FFB6C1"), name = "Severity") +
+  theme_minimal()
+
+# Severity vs. Period
+ggplot(data, aes(x = Period, fill = Severity.f)) +
+  geom_bar(position = "fill") +
+  labs(title = "Severity Distribution by Period", x = "Period", y = "Proportion") +
+  scale_fill_manual(values = c("#A1C9F4", "#FFB6C1"), name = "Severity") +
+  theme_minimal()
+```
+
+Observation summary
+
+1. Visit: The plot shows a clear increasing trend in severity (proportion of 1s) over visits.
+Initially (Visits 0–3), the severity proportion is low, but from Visit 4 onward, there is a sharp increase.
+The trend suggests a potential nonlinear relationship between Visit and Severity.
+A quadratic / cubic /   splines((piecewise,visit 0-3/4-7)  term for Visit might need to be added to improve model fit.
+
+2. Gender also shows a notable effect, with females having a higher proportion of severe cases than males.
+3. For age groups, the severity distribution appears relatively even, suggesting no strong relationship. 
+4. SNP distribution is mostly even, but SNP type 2 has a slightly lower severity proportion. 
+5. Period A shows a slightly higher severity proportion than Period B.
+
+
+### 2.3 Interaction between Visit and other variables
+
+Create facet plots where X-axis is always Visit, and facets are based on other categorical variables like Gender, Age Group, SNP, and Period.
+```{r }
+
+# Severity vs. Visit Faceted by Gender
+ggplot(data, aes(x = as.factor(Visit), fill = Severity.f)) +
+  geom_bar(position = "fill") +
+  labs(title = "Severity Distribution by Visit (Faceted by Gender)", x = "Visit", y = "Proportion") +
+  scale_fill_manual(values = c("#A1C9F4", "#FFB6C1"), name = "Severity") +
+  facet_grid(. ~ sex) +  # Facet by Gender (one panel for each gender)
+  theme_minimal()
+
+# Faceted Box Plots: Age as a Continuous Variable
+ggplot(data, aes(x = Severity.f, y = Age, fill = Severity.f)) +
+  geom_boxplot(outlier.shape = 16, outlier.size = 2, alpha = 0.6) +
+  labs(title = "Age Distribution by Severity (Faceted by Visit)", x = "Severity", y = "Age") +
+  scale_fill_manual(values = c("#A1C9F4", "#FFB6C1")) +
+  facet_grid(. ~ as.factor(Visit)) +  # Facet by Visit
+  theme_minimal()
+
+
+# Severity vs. Visit Faceted by Age Group
+ggplot(data, aes(x = as.factor(Visit), fill = Severity.f)) +
+  geom_bar(position = "fill") +
+  labs(title = "Severity Distribution by Visit (Faceted by Age Group)", x = "Visit", y = "Proportion") +
+  scale_fill_manual(values = c("#A1C9F4", "#FFB6C1"), name = "Severity") +
+  facet_grid(. ~ Age_Group) +  # Facet by Age Group
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate X-axis labels
+
+
+# Severity vs. Visit Faceted by SNP
+ggplot(data, aes(x = as.factor(Visit), fill = Severity.f)) +
+  geom_bar(position = "fill") +
+  labs(title = "Severity Distribution by Visit (Faceted by SNP)", x = "Visit", y = "Proportion") +
+  scale_fill_manual(values = c("#A1C9F4", "#FFB6C1"), name = "Severity") +
+  facet_grid(. ~ SNP) +  # Facet by SNP (0,1,2)
+  theme_minimal()
+
+
+# Severity vs. Visit Faceted by Period
+ggplot(data, aes(x = as.factor(Visit), fill = Severity.f)) +
+  geom_bar(position = "fill") +
+  labs(title = "Severity Distribution by Visit (Faceted by Period)", x = "Visit", y = "Proportion") +
+  scale_fill_manual(values = c("#A1C9F4", "#FFB6C1"), name = "Severity") +
+  facet_grid(. ~ Period) +  # Facet by Period (A vs. B)
+  theme_minimal()
+
+```
+
+Observation summary
+
+1. Gender-based differences is obvious in the severity progression over visits. Specifically, females experience sharper increase in severity proportion after the fourth visit, while males show a steadier trend. 
+2. Age groups show no clear pattern, with severity levels evenly distributed across visits.
+3. Weak interaction between SNP and visit. The effect of SNP is minor compared to the strong influence of visit on severity.
+4. Moderate interaction between visit and period. Severity progression over visits differs between periods, with a steeper increase in earlier years (Period A). 
+
+
+### 2.4 Individual difference / Random effect exploration
+
+The plot clearly shows individual differences in predicted severity probabilities over visits. 
+Patients are expected to have random intercept (baselines) and random slopes. 
+Some patients progress quickly (steeper slopes), while others remain at lower severity probabilities for longer.
+
+```{r }
+
+# Fit a simple GLMM (no random slopes yet)
+glmm_simple <- glmer(Severity.f ~ Visit + (1 | id), family = binomial, data = data)
+
+# Get fitted probabilities
+data$fitted_prob <- predict(glmm_simple, type = "response")
+
+# Randomly select 20% of individuals :
+set.seed(123)
+selected_ids <- sample(unique(data$id), 100)
+subset_data <- data[data$id %in% selected_ids, ]
+
+# Plot fitted probabilities across visits for some patients
+ggplot(subset_data, aes(x = Visit, y = fitted_prob, group = id, color = as.factor(id))) +
+  geom_line(alpha = 0.7) +
+  geom_point() +
+  labs(title = "Individual Differences in Fitted Probabilities (100 Patients)",
+       x = "Visit", y = "Predicted Probability of Severity") +
+  theme_minimal() +
+  theme(legend.position = "none")  # Hide legend for clarity
+
+```
+
+
+## 3.Model Specification
+
+  Elaborated GLMM Model:
+  
+  1. Mean Structure/Main effect: 
+    - Response variable (Y): Severity level
+    - Explanatory variables (X): Visit, gender, age, SNP, Period
+    - Interaction: e.g. Visit * Sex
+    - Nonlinear relationships quadratic or cubic
+
+  2. Include random effects with different intercepts/slopes
+
+
+
+## 4.Model Building & Selection
+
+  Starting with an extremely elaborate model in GLMM, causes the software fail
+  to converge mostly due to collinearity. 
+  glmer() assumes that the random part completely captures the correlations,
+  thus it uses a diagonal Var-Cov matrix just to estimate the variances 
+  (diagonal elements).
+  The model fails to converge if one considers quadratic terms for both
+  'Visit' and 'Age'. Also, considering a polynomial of the third degree for
+  'Visit' makes it hard to infer later in addition to some convergence problems.
+  Therefore, We start with the following elaborate model. The nAGQ is chosen by 
+  starting from 1 (Laplace approximation case) and increasing to reach stabilized
+  fixed-effects parameters estimations, beside avoiding to become computationally
+  intensive.
+
+  the final model:
+  Starting with an elaborate model, and considering all interactions and second
+  order polynomials of the continuous variables, and removing the non-significant
+  parameters by testing different combinations of these complex terms, finally
+  the model 6 is the best one reached among all these models.
+
+
+### Model 1: Severity.f ~ poly(Visit, 2) * sex + Age + SNP.f + Period + (Visit | id)
+
+The elaborated model
+
+```{r }
+
+model.1 <- glmer(Severity.f ~ poly(Visit, 2) * sex + Age + SNP.f + Period + (Visit | id), 
+                 data = data, family = "binomial", 
+                 nAGQ = 1, control = glmerControl(optimizer = "bobyqa"))
+summary(model.1)
+
+```
+
+
+### Model 2: Severity.f ~ Visit * sex + Age + SNP.f + Period + (Visit | id)
+remove poly term
+```{r }
+
+model.2 <- glmer(Severity.f ~ Visit * sex + Age + SNP.f + Period + (Visit | id), 
+                 data = data, family = "binomial", 
+                 nAGQ = 1, control = glmerControl(optimizer = "bobyqa"))
+
+summary(model.2)
+
+```
+
+### Model 1 vs. Model 2 --> model 2 wins, no need to add poly term
+```{r }
+anova(model.1, model.2)
+```
+
+### Model 6 (remove SNP&Age): Severity.f ~  Visit:Sex  + Period + (Visit | id) 
+simplify the mean effect part: remove SNP & Age
+```{r }
+
+model.6 <- glmer(Severity.f ~ Visit * sex + Period + (Visit | id), 
+                   data = data, family = "binomial", 
+                   nAGQ = 1, control = glmerControl(optimizer = "bobyqa"))
+summary(model.6)
+
+```
+
+### Model 2 vs. Model 6 --> model 6 wins
+```{r }
+anova(model.2, model.6)
+```
+
+### Model 68 (remove intercept) 
+simplify the mean effect part: remove SNP & Age
+```{r }
+
+model.68 <- glmer(Severity.f ~ Visit * sex + Period + (1 | id), 
+                   data = data, family = "binomial", 
+                   nAGQ = 15, control = glmerControl(optimizer = "bobyqa"))
+summary(model.68)
+
+```
+
+```{r }
+anova(model.6, model.68)
+```
+## 5.Marginal Effects
+
+### Model 60 (fit model 6 with `GLMMadaptive` ): Severity.f ~  Visit * sex + Period + (Visit | id)
+Why model 60:
+- GLMMadaptive uses Adaptive Gaussian-Hermite Quadrature (AGHQ) to approximate integrals over random effects, offering more flexibility than lme4::glmer()'s nAGQ.
+- More accurate for small or skewed data: Handles complex random effect structures better.
+- More stable variance estimates: glmer() with nAGQ = 1 may underestimate random effect variance.
+- Cross-checking model stability: Comparing results from glmer() and GLMMadaptive helps assess GLMM reliability. 
+If estimates are similar, glmer() is likely sufficient.
+
+```{r }
+# we have increased nAGQ to finally reach a stabilized model at nAGQ=11 
+model.60 <- mixed_model(Severity.f ~ Visit * sex + Period, random = ~Visit|id, 
+                        data = data, family =  "binomial", control = list(nAGQ = 11))
+
+
+summary(model.60)
+
+# The model is fitted using the adaptive Guassian quadrature approach which results
+# to more reliable estimations.
+
+```
+
+### Parameters of Marginal Effects
+
+Use GLMMadaptive to get mariginal effects: 
+
+```{r }
+# Marginalized parameters
+marginal_coefs(model.60, std_errors = TRUE)
+```
+
+## 6.Model assumption check
+
+The final model is model.6 
+
+Investigate the distribution of the posterior modes of the random effects in the random intercepts model `model.6` . 
+
+When fitting a random intercepts model (model.6), we typically assume that:
+- Random intercepts and slopes follow a normal (Gaussian) distribution.
+- There should be no extreme outliers or strong skewness in the distribution of random effects.
+
+Investigating the posterior modes (also known as the empirical Bayes estimates) of these random effects helps us check if this assumption holds and whether there are extreme deviations.
+
+### 6.1 dotplot
+
+Conclusion: The model's normality assumption appears to be mostly valid:
+- Random intercepts roughly follow a normal distribution, with no extreme outliers.
+- Random slopes for Visit are tightly clustered near 0, indicating limited variability but still roughly symmetric.
+
+```{r }
+#Caterpillar plot for EB estimates of the random effects
+
+library(lattice)
+dotplot(ranef(model.6, which = "id", condVar = TRUE), 
+        scales = list(y = list(alternating = 0))) # suppress id names
+
+#The blue dots are the conditional modes with error bars. 
+# the variations in the random slopes is much lesser than the variations in
+# random intercepts. This means considering random slopes in the model is not as
+# vital as considering the random intercepts
+
+```
+
+### 6.2 Histogram
+
+The distribution of random intercepts roughly follows a normal distribution but is slightly right-skewed. 
+The distribution of random slopes approximately follows a normal distribution.
+```{r }
+#Histogram for EB estimates of the random effects
+# Extract random effects for the grouping factor "id"
+re <- ranef(model.6, condVar = TRUE)$id  
+
+# Convert to a data frame
+random_effects_df <- as.data.frame(re)
+
+# Check column names to verify the correct extraction
+print(names(random_effects_df))
+
+# Rename columns if necessary
+colnames(random_effects_df) <- c("Random_Intercepts", "Random_Slopes")
+
+# Set up 2-panel layout for histograms
+par(mfrow = c(1, 2))  
+
+# Histogram for random intercepts
+hist(random_effects_df$Random_Intercepts, 
+     main = "", 
+     xlab = "Histogram of Random Intercepts", 
+     freq = FALSE, 
+     col = "gray", 
+     breaks = 20)
+
+# Histogram for random slopes
+hist(random_effects_df$Random_Slopes, 
+     main = "", 
+     xlab = "Histogram of Random Slopes", 
+     freq = FALSE, 
+     col = "gray", 
+     breaks = 20)
+
+# Reset plot layout
+par(mfrow = c(1, 1))
+
+
+```
+
+Conclusion: The normality assumption for random intercept and random slope is reasonable. Random intercepts are a little skewed to the right, while random slopes are slightly skewed to the left side.
+
+## 7. Graphical visualization
+
+Graphical visualization: Use visualization techniques to examine the mean structure
+
+
+Compute fitted probabilities: 
+
+### 7.1 Total without comparison in Sex
+- The subject-specific fitted probabilities of high disease severity for ... 
+```{r }
+#Subject-specific fitted probabilities
+data.fitted.1 <- data.frame(id = 8, 
+                            Visit = 0:7, 
+                            Age = 79,  
+                            sex = "female",  
+                            SNP = 0,
+                            Period = "A"
+                           )  
+# predict probability
+data.fitted.1$fit <- predict(model.6, newdata = data.fitted.1, type = "response")
+
+xyplot(fit ~ Visit,
+       data = data.fitted.1,  
+       panel = function (...) {
+           panel.xyplot(..., lty = c(1),
+                        col = "black", lwd = 2, type = "l")
+       }, 
+       xlab = "Visits", 
+       main = "Fitted conditional probability of high Disease Severity for individual",
+       ylab = "Probability of high Disease Severity",
+       scales = list(x = list(at = 0:7)))
+
+```
+- The fitted probabilities for the median individual...
+```{r }
+#Fitted probabilities for the median individual
+
+data.fitted.2 <- data.frame(id = 10, 
+                            Visit = 0:7, 
+                            Age = 48.3,  
+                            sex = "male",  
+                            SNP = 1,
+                            Period = "A"
+                           ) 
+
+# predict probability
+data.fitted.2$fit <- predict(model.6, newdata = data.fitted.2, type = "response",re.form = NA)
+
+xyplot(fit ~ Visit,
+       data = data.fitted.2,  
+       panel = function (...) {
+           panel.xyplot(..., lty = c(1),
+                        col = "black", lwd = 2, type = "l")
+       }, 
+       xlab = "Visits", 
+       main = "Fitted conditional probability of high Disease Severity for median subject",
+       ylab = "Probability of high Disease Severity",
+       scales = list(x = list(at = 0:7)))
+
+```
+
+- The marginal (i.e., population averaged) fitted probabilities....
+
+```{r }
+log.odds <- predict(model.6, newdata = data, type = "link", re.form = NA)
+meas.index <- match(data$id, unique(data$id))
+B <- 100
+probs.b <- matrix(NA, nrow = nrow(data), ncol = B)
+
+for(bb in 1:B){
+  b <- rnorm(length(unique(data$id)), 0, 
+             sqrt(VarCorr(model.6)[[1]][1]))[meas.index]
+  probs.b[, bb] <- plogis(log.odds + b) 
+}
+
+data$MargProbs <- data$fit <- rowMeans(probs.b)
+
+
+xyplot(fit ~ Visit,
+       data = data[data$id == 1, ],
+       panel = function (...) {
+           panel.xyplot(..., lty = c(1),
+                        col = "black", lwd = 2, type = "l")
+       }, 
+       xlab = "Visits", 
+       main = "Fitted conditional probability of high Disease Severity for marginal effect",
+       ylab = "Probability of high Disease Severity",
+       scales = list(x = list(at = 0:7)))
+```
+
+
+Individual subject vs. Median subject vs. Marginal 
+```{r}
+# Add a 'Group' column to distinguish the three sets of predictions
+data.fitted.1$Group <- "Individual subject"
+data.fitted.2$Group <- "Median subject"
+
+# Compute marginal effect (averaging over random effects)
+log.odds <- predict(model.6, newdata = data, type = "link", re.form = NA)
+meas.index <- match(data$id, unique(data$id))
+B <- 100
+probs.b <- matrix(NA, nrow = nrow(data), ncol = B)
+
+for (bb in 1:B) {
+    b <- rnorm(length(unique(data$id)), 0, sqrt(VarCorr(model.6)[[1]][1]))[meas.index]
+    probs.b[, bb] <- plogis(log.odds + b)
+}
+
+# Compute the average marginal probabilities
+data$MargProbs <- rowMeans(probs.b)
+
+# Extract subject id = 1 for marginal effect plotting and ensure all required columns exist
+data.fitted.3 <- data[data$id == 1, c("id", "Visit", "MargProbs", "Age", "sex", "SNP", "Period")]
+
+# Ensure column names match `data.fitted.1` and `data.fitted.2`
+colnames(data.fitted.3)[colnames(data.fitted.3) == "MargProbs"] <- "fit"
+data.fitted.3$Group <- "Marginal effect"
+
+# Ensure 'Group' column is a factor with correct levels
+data.fitted.3$Group <- factor(data.fitted.3$Group, levels = c("Individual subject", "Median subject", "Marginal effect"))
+
+# Combine all three datasets
+data.fitted <- rbind(data.fitted.1, data.fitted.2, data.fitted.3)
+
+# Convert 'Group' into a factor for plotting
+data.fitted$Group <- factor(data.fitted$Group, levels = c("Individual subject", "Median subject", "Marginal effect"))
+
+# Plot the fitted probabilities
+xyplot(fit ~ Visit, 
+       groups = Group,  
+       data = data.fitted,  
+       type = "l",
+       lty = c(1, 2, 3),  # Solid, dashed, dotted
+       col = c("black", "black", "black"),  
+       lwd = 2,  
+       xlab = "Visits", 
+       main = "Fitted Conditional Probability of High Disease Severity",
+       ylab = "Probability of High Disease Severity",
+       key = list(
+           space = "top",  # Place legend above the lines
+           columns = 3,    # Three labels in a single row
+           lines = list(lty = c(1, 2, 3), col = c("black", "black", "black")),
+           text = list(c("Individual subject", "Median subject", "Marginal effect"))
+       ))
+
+```
+
+Summary:
+Subject-Specific: Calculate and visualize the probability trend for a specific individual.  
+Median Individual: Calculate the probability for an individual with only fixed effects(set random effect 0).
+Marginal level: Calculate the population level average probability, integrating random effects and ignoring individual difference.
+
+
+From the comparison above, we can see the clear individual differences. 
+When we remove individual variability and consider only the median subject (only fixed effects), the predicted probability is the lowest level. 
+The marginal effect falls in between, representing the population level average.
+
+
+### 7.2 Comparison in Sex
+
+Individual subject vs. Median subject vs. Marginal : Male vs. Female
+
+Since we can see significant difference between male and female, we can visualize the probability difference:
+
+- The subject-specific fitted probabilities of high disease severity for ... 
+```{r }
+#Subject-specific fitted probabilities
+# Create dataset for ID = 8, predicting as both male and female
+data.fitted.4 <- data.frame(
+    id = 8, 
+    Visit = 0:7, 
+    Age = 79,  
+    sex = c(rep("male", 8), rep("female", 8)),  # Predict for both male and female
+    SNP = 1,
+    Period = "A"
+)
+
+# Predict probability for both male and female
+data.fitted.4$fit <- predict(model.6, newdata = data.fitted.4, type = "response")
+
+# Convert 'sex' to factor for faceting
+data.fitted.4$sex <- factor(data.fitted.4$sex, levels = c("male", "female"))
+
+# Create a faceted plot for male vs. female
+xyplot(fit ~ Visit | sex,
+       data = data.fitted.4,  
+       panel = function (...) {
+           panel.xyplot(..., lty = c(1),
+                        col = "black", lwd = 2, type = "l")
+       }, 
+       xlab = "Visits", 
+       main = "Fitted Conditional Probability of High Disease Severity",
+       ylab = "Probability of High Disease Severity",
+       scales = list(x = list(at = 0:7)))
+
+
+```
+- The fitted probabilities for the median individual...
+```{r }
+#Fitted probabilities for the median individual
+
+# Create dataset for ID = 10, predicting as both male and female
+data.fitted.5 <- data.frame(
+    id = 10, 
+    Visit = 0:7, 
+    Age = 48.3,  
+    sex = c(rep("male", 8), rep("female", 8)),  # Predict for both male and female
+    SNP = 1,
+    Period = "A"
+)
+
+# Predict probability for both male and female
+data.fitted.5$fit <- predict(model.6, newdata = data.fitted.5, type = "response", re.form = NA)
+
+# Convert 'sex' to factor for faceting
+data.fitted.5$sex <- factor(data.fitted.5$sex, levels = c("male", "female"))
+
+# Create a faceted plot for male vs. female
+xyplot(fit ~ Visit | sex,
+       data = data.fitted.5,  
+       panel = function (...) {
+           panel.xyplot(..., lty = c(1),
+                        col = "black", lwd = 2, type = "l")
+       }, 
+       xlab = "Visits", 
+       main = "Fitted Conditional Probability of High Disease Severity for Median Subject",
+       ylab = "Probability of High Disease Severity",
+       scales = list(x = list(at = 0:7)))
+```
+
+- The marginal (i.e., population averaged) fitted probabilities.
+
+```{r }
+# Create dataset: Duplicate data for male and female predictions
+data.marginal <- data
+data.marginal <- data.marginal[rep(1:nrow(data.marginal), 2), ]  # Duplicate rows for both sexes
+data.marginal$sex <- rep(c("male", "female"), each = nrow(data) )  # Assign male/female
+
+# Predict log-odds for both male and female separately
+log.odds <- predict(model.6, newdata = data.marginal, type = "link", re.form = NA)
+meas.index <- match(data.marginal$id, unique(data.marginal$id))
+
+# Number of bootstrap samples
+B <- 100
+probs.b <- matrix(NA, nrow = nrow(data.marginal), ncol = B)
+
+# Simulate random effects and compute probabilities
+for (bb in 1:B) {
+    b <- rnorm(length(unique(data.marginal$id)), 0, sqrt(VarCorr(model.6)[[1]][1]))[meas.index]
+    probs.b[, bb] <- plogis(log.odds + b)  # Convert log-odds to probabilities
+}
+
+# Compute the marginal probabilities as the mean over bootstrap samples
+data.marginal$MargProbs <- rowMeans(probs.b)
+data.marginal$fit <- data.marginal$MargProbs  # Align with previous plotting structure
+
+# Convert 'sex' to factor for faceting
+data.marginal$sex <- factor(data.marginal$sex, levels = c("male", "female"))
+
+# Plot the marginal probabilities by gender
+xyplot(fit ~ Visit | sex,
+       data = data.marginal[data.marginal$id == 1, ],  # Select one subject (id = 2)
+       panel = function (...) {
+           panel.xyplot(..., lty = c(1),
+                        col = "black", lwd = 2, type = "l")
+       }, 
+       xlab = "Visits", 
+       main = "Marginal Fitted Probability of High Disease Severity by Gender",
+       ylab = "Probability of High Disease Severity",
+       scales = list(x = list(at = 0:7)))
+
+
+```
+
+Individual subject vs. Median subject vs. Marginal 
+```{r}
+# Duplicate dataset for male and female
+data.marginal <- data
+data.marginal <- data.marginal[rep(1:nrow(data.marginal), 2), ]  # Duplicate rows for both sexes
+data.marginal$sex <- rep(c("male", "female"), each = nrow(data))  # Assign male/female
+
+# Predict log-odds for both male and female separately
+log.odds <- predict(model.6, newdata = data.marginal, type = "link", re.form = NA)
+meas.index <- match(data.marginal$id, unique(data.marginal$id))
+
+# Number of bootstrap samples
+B <- 100
+probs.b <- matrix(NA, nrow = nrow(data.marginal), ncol = B)
+
+# Simulate random effects and compute probabilities
+for (bb in 1:B) {
+    b <- rnorm(length(unique(data.marginal$id)), 0, sqrt(VarCorr(model.6)[[1]][1]))[meas.index]
+    probs.b[, bb] <- plogis(log.odds + b)  # Convert log-odds to probabilities
+}
+
+# Compute the marginal probabilities as the mean over bootstrap samples
+data.marginal$MargProbs <- rowMeans(probs.b)
+data.marginal$fit <- data.marginal$MargProbs  # Align with previous plotting structure
+data.marginal$Group <- "Marginal effect"
+
+# ---- Create datasets for Individual and Median predictions ---- #
+# Individual subject
+data.fitted.4$Group <- "Individual subject"
+data.fitted.5$Group <- "Median subject"
+
+# Extract subject id = 1 for marginal effect plotting and ensure all required columns exist
+data.fitted.6 <- data.marginal[data.marginal$id == 1, c("id", "Visit", "MargProbs", "Age", "sex", "SNP", "Period", "Group")]
+colnames(data.fitted.6)[colnames(data.fitted.6) == "MargProbs"] <- "fit"
+
+# Combine all three datasets
+data.fitted_sex <- rbind(data.fitted.4, data.fitted.5, data.fitted.6)
+
+# Ensure 'Group' column is a factor with correct levels
+data.fitted_sex$Group <- factor(data.fitted_sex$Group, levels = c("Individual subject", "Median subject", "Marginal effect"))
+
+# Convert 'sex' to a factor
+data.fitted_sex$sex <- factor(data.fitted_sex$sex, levels = c("male", "female"))
+
+# ---- Plot all three probability types while faceting by gender ---- #
+xyplot(fit ~ Visit | sex,
+       groups = Group,  
+       data = data.fitted_sex,  
+       type = "l",
+       lty = c(1, 2, 3),  # Solid, dashed, dotted
+       col = c("black", "black", "black"),  
+       lwd = 2,  
+       xlab = "Visits", 
+       main = "Fitted Conditional Probability of High Disease Severity by Gender",
+       ylab = "Probability of High Disease Severity",
+       key = list(
+           space = "top",  # Place legend above the lines
+           columns = 3,    # Three labels in a single row
+           lines = list(lty = c(1, 2, 3), col = c("black", "black", "black")),
+           text = list(c("Individual subject", "Median subject", "Marginal effect"))
+       ))
+
+
+```
+
+
+## 8.Conclusion: Summarize key findings based on the final validated model.
+Report the parameter estimates with the corresponding 95\% CIs.
+
+model.6 recap: 
+```{r }
+model.6 <- glmer(Severity.f ~ Visit * sex + Period + (Visit | id), 
+                   data = data, family = "binomial", 
+                   nAGQ = 1, control = glmerControl(optimizer = "bobyqa"))
+summary(model.6)
+
+```
+
+95% confidence intervals (CIs) for the log-odds
+```{r }
+# Table of estimates with 95% CI
+se <- sqrt(diag(vcov(model.6)))
+(tab <- cbind(Est = fixef(model.6), 
+              LL = fixef(model.6) - 1.96 * se, 
+              UL = fixef(model.6) + 1.96 * se))
+ 
+```
+
+95% confidence intervals (CIs) for odds ratios
+```{r }
+tab_OR <- exp(tab)  # Convert log-odds to odds ratios (exp)
+tab_OR
+```
+Marginal effect
+```{r }
+# we have increased nAGQ to finally reach a stabilized model at nAGQ=11 
+model.60 <- mixed_model(Severity.f ~ Visit * sex + Period, random = ~Visit|id, 
+                        data = data, family =  "binomial", control = list(nAGQ = 11))
+summary(model.60)
+
+# The model is fitted using the adaptive Guassian quadrature approach which results
+# to more reliable estimations.
+```
+
+Use GLMMadaptive to get mariginal effects: 
+
+```{r }
+# Marginalized parameters
+marginal_coefs = marginal_coefs(model.60, std_errors = TRUE)
+marginal_coefs
+```
+
+```{r }
+# 1. Get coefficient matrix from marginal_coefs()
+x <- marginal_coefs(model.60, std_errors = TRUE)
+tab <- as.data.frame(x$coef_table)
+
+# 2. Add rownames as a column (optional, for clarity)
+tab$Term <- rownames(tab)
+
+# 3. Calculate OR and CI
+tab$OR <- exp(tab$Estimate)
+tab$Lower_CI <- exp(tab$Estimate - 1.96 * tab$Std.Err)
+tab$Upper_CI <- exp(tab$Estimate + 1.96 * tab$Std.Err)
+
+# 4. Reorder columns for clean output
+tab_clean <- tab[, c("Term", "Estimate", "Std.Err", "z-value", "p-value", "OR", "Lower_CI", "Upper_CI")]
+
+# 5. Optional: round for display
+tab_clean <- transform(tab_clean,
+  Estimate = round(Estimate, 4),
+  Std.Err = round(Std.Err, 4),
+  `z-value` = round(`z-value`, 2),
+  OR = round(OR, 4),
+  Lower_CI = round(Lower_CI, 4),
+  Upper_CI = round(Upper_CI, 4)
+)
+
+tab_clean
+
+```
